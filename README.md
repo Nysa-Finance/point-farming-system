@@ -1,4 +1,4 @@
-# points_farming.py
+# NYSA Points Farming Tracker for Kamino Pools
 
 Snapshot-based point farming tracker for USDC lenders on a Kamino (`klend`) lending market.
 
