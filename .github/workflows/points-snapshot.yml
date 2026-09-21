@@ -1,0 +1,128 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Daily points snapshot.
+#
+# Reads the Kamino market, credits points for the elapsed interval, and commits the
+# updated points_state.csv. The dapp reads that file through its own /api/points proxy.
+#
+# This file MUST live on the default branch: GitHub only evaluates `schedule:` there,
+# regardless of which branch the workflow would check out.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Points snapshot
+
+on:
+  schedule:
+    # 03:17 UTC = 05:17 Europe/Amsterdam in summer (CEST), 04:17 in winter (CET).
+    # GitHub cron is UTC only and does not follow DST, so pick the half of the year that
+    # matters and accept the one-hour drift, or run twice and let the idempotent
+    # elapsed-time maths sort it out.
+    #
+    # The :17 is deliberate. Jobs scheduled on the hour queue behind everyone else's and
+    # routinely start 10-30 minutes late; an odd minute is served closer to on time.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Write even if the supply-collapse guard trips (use only when the drop is real)'
+        type: boolean
+        default: false
+      reset_scope:
+        description: 'Accept a changed market / tracked mints'
+        type: boolean
+        default: false
+
+# Contents write is what lets the job commit the updated leaderboard back.
+permissions:
+  contents: write
+
+# A manual run must never race the scheduled one onto the same file. Queue, do not cancel:
+# a cancelled run loses that interval's accrual.
+concurrency:
+  group: points-snapshot
+  cancel-in-progress: false
+
+jobs:
+  # Scoring rules are tested before anything is allowed to write a leaderboard.
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  snapshot:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the rebase before push has something to rebase onto.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Check RPC is configured
+        env:
+          SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+        run: |
+          if [ -z "$SOLANA_RPC_URL" ]; then
+            echo "::error::SOLANA_RPC_URL secret is not set."
+            echo "The tracker calls getProgramAccounts, which api.mainnet-beta.solana.com"
+            echo "rate-limits and usually refuses outright. Add a keyed RPC endpoint under"
+            echo "Settings -> Secrets and variables -> Actions -> New repository secret."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Take snapshot
+        env:
+          SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+          # Repository variables, all optional — unset falls back to the defaults in
+          # points_core.py. KAMINO_MARKET must match VITE_KAMINO_MARKET in the dapp.
+          KAMINO_MARKET: ${{ vars.KAMINO_MARKET }}
+          TRACKED_MINTS: ${{ vars.TRACKED_MINTS }}
+          POINTS_BASIS: ${{ vars.POINTS_BASIS }}
+          MIN_SUPPLY_RATIO: ${{ vars.MIN_SUPPLY_RATIO }}
+          JITTER_MAX_SECONDS: ${{ vars.JITTER_MAX_SECONDS }}
+        run: |
+          python points_farming.py --once \
+            ${{ inputs.force && '--force' || '' }} \
+            ${{ inputs.reset_scope && '--reset-scope' || '' }}
+
+      - name: Commit leaderboard
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git add points_state.csv points_meta.json snapshots/
+          if git diff --cached --quiet; then
+            echo "No change — nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(points): snapshot $(date -u '+%Y-%m-%d %H:%M UTC')"
+
+          # Retry the rebase+push: a manual run queued behind this one, or a human pushing
+          # to the branch, would otherwise lose an interval of accrual.
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push; then
+              echo "Pushed on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push attempt ${attempt} failed; retrying."
+            sleep 5
+          done
+          echo "::error::Could not push the updated leaderboard after 3 attempts."
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Points snapshot"
+            python summarise.py || echo "- No metadata written — the run failed before the write step."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,48 +1,43 @@
 """
-Point farming per lender USDC su un market Kamino (klend).
+Point farming for lenders on a Kamino (klend) lending market.
 
-Ogni SNAPSHOT_INTERVAL_SECONDS secondi:
-  1. legge il market on-chain (stesso codice di suppliers_usdc_filtered.py)
-  2. filtra i supplier del reserve USDC
-  3. accredita punti = saldo_precedente_usd x ore_trascorse a ogni address
-  4. aggiorna points_state.csv (stato corrente, ordinato per punti = la "classifica")
-  5. archivia lo snapshot grezzo in snapshots/YYYY-MM-DD_HHhMM.csv
+Each cycle:
+  1. Read the market on-chain (reserves + obligations) via RPC.
+  2. Sum every tracked deposit per owner into a USD balance.
+  3. Credit points for the elapsed time.
+  4. Rewrite points_state.csv (the leaderboard) and archive the raw snapshot.
 
-Per ora l'intervallo e' impostato a 2 minuti SOLO per test. In produzione
-alzalo (es. 3600 = ogni ora) cambiando SNAPSHOT_INTERVAL_SECONDS qui sotto.
+Two run modes:
+  python points_farming.py --once   one cycle, then exit. Exit code 0 on success,
+                                    1 on any failure. This is what CI runs.
+  python points_farming.py          daemon loop every SNAPSHOT_INTERVAL_SECONDS,
+                                    for local development.
+
+Scoring rules, state I/O and the safety guards live in points_core.py (stdlib only, unit
+tested). This file is the RPC layer and the CLI. Configuration is by environment variable
+so CI never has to edit source — see the table in README.md.
 """
 
+import argparse
 import asyncio
-import csv
 import hashlib
+import json
 import os
+import random
+import sys
 import time
 from datetime import datetime, timezone
 
 import base58
 from anchorpy import Program, Provider, Idl, Wallet
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Finalized
 from solana.rpc.types import MemcmpOpts
 from solders.pubkey import Pubkey
 
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
-RPC_URL = "https://api.mainnet-beta.solana.com"
-KLEND_PROGRAM_ID = Pubkey.from_string("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD")
-MARKET_ADDRESS = "FteaGMVCLDF4eonrTiQkRQ5kby5ohwCfaMD2mNiPkZL7"
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-IDL_PATH = "klend_idl.json"
+import points_core as core
 
-SNAPSHOT_INTERVAL_SECONDS = 120  # <-- TEST: 2 minuti. Upgradeable (es. 3600 = 1h).
-STATE_FILE = "points_state.csv"
-SNAPSHOT_DIR = "snapshots"
-
-SCALE = 1 << 60  # Fraction U68F60 — tutti i campi "_sf" sono scalati cosi'
-
-
-def sf_to_float(raw_sf: int) -> float:
-    return raw_sf / SCALE
+KLEND_PROGRAM_ID = Pubkey.from_string(core.KLEND_PROGRAM_ID)
 
 
 def account_discriminator(name: str) -> bytes:
@@ -50,169 +45,134 @@ def account_discriminator(name: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# FETCH ON-CHAIN (stessa logica di suppliers_usdc_filtered.py)
+# FETCH ON-CHAIN
 # ---------------------------------------------------------------------------
-async def fetch_accounts_safe(client, program, account_name):
+async def fetch_accounts_filtered(client, program, account_name, market_offset, market_pk):
+    """Every account of one type belonging to ONE market.
+
+    The market memcmp runs on the RPC node. Without it this asks for every Reserve and every
+    Obligation in the whole klend program — all Kamino markets at once, hundreds of
+    megabytes, which public and most keyed RPCs simply refuse.
+    """
     disc = account_discriminator(account_name)
     resp = await client.get_program_accounts(
         KLEND_PROGRAM_ID,
         encoding="base64",
-        filters=[MemcmpOpts(offset=0, bytes=base58.b58encode(disc).decode())],
+        commitment=Finalized,
+        filters=[
+            MemcmpOpts(offset=0, bytes=base58.b58encode(disc).decode()),
+            MemcmpOpts(offset=market_offset, bytes=str(market_pk)),
+        ],
     )
-    decoded = []
+    decoded, skipped = [], 0
     for entry in resp.value:
         try:
-            acc = program.coder.accounts.decode(entry.account.data)
-            decoded.append((entry.pubkey, acc))
+            decoded.append((entry.pubkey, program.coder.accounts.decode(entry.account.data)))
         except Exception:
-            pass
+            skipped += 1
+    if skipped:
+        print(f"  {account_name}: {len(decoded)} decoded, {skipped} skipped (size mismatch)")
     return decoded
 
 
-async def fetch_usdc_suppliers(market_address: str):
-    """Ritorna [{owner, supplied_usd}] per il reserve USDC del market dato."""
-    client = AsyncClient(RPC_URL)
-    with open(IDL_PATH) as f:
-        idl = Idl.from_json(f.read())
-    provider = Provider(client, Wallet.dummy())
-    program = Program(idl, KLEND_PROGRAM_ID, provider)
-    market_pk = Pubkey.from_string(market_address)
+async def fetch_market_deposits(market_address: str):
+    """[{owner, mint, supplied_usd}] for every tracked reserve in the market."""
+    client = AsyncClient(core.RPC_URL, timeout=120)
+    try:
+        with open(core.IDL_PATH) as f:
+            raw_idl = f.read()
+        idl_dict = json.loads(raw_idl)
+        program = Program(Idl.from_json(raw_idl), KLEND_PROGRAM_ID, Provider(client, Wallet.dummy()))
+        market_pk = Pubkey.from_string(market_address)
 
-    all_reserves = await fetch_accounts_safe(client, program, "Reserve")
-    reserves = {
-        str(pk): acc for pk, acc in all_reserves
-        if str(acc.lending_market) == str(market_pk)
-    }
+        reserve_offset = core.idl_field_offset(idl_dict, "Reserve", "lendingMarket")
+        obligation_offset = core.idl_field_offset(idl_dict, "Obligation", "lendingMarket")
 
-    usdc_reserve_pk, usdc_reserve = None, None
-    for pk, acc in reserves.items():
-        if str(acc.liquidity.mint_pubkey) == USDC_MINT:
-            usdc_reserve_pk, usdc_reserve = pk, acc
-            break
-    if usdc_reserve is None:
-        await client.close()
-        raise RuntimeError("Reserve USDC non trovato in questo market.")
+        reserves = dict(await fetch_accounts_filtered(
+            client, program, "Reserve", reserve_offset, market_pk))
+        if not reserves:
+            raise RuntimeError(
+                f"no reserves found for market {market_address} — wrong market address, or the "
+                f"RPC silently truncated the getProgramAccounts response")
 
-    total_liquidity = (
-        usdc_reserve.liquidity.total_available_amount
-        + sf_to_float(usdc_reserve.liquidity.borrowed_amount_sf)
-    )
-    collateral_supply = usdc_reserve.collateral.mint_total_supply
-    exchange_rate = total_liquidity / collateral_supply if collateral_supply > 0 else 1.0
-    decimals = usdc_reserve.liquidity.mint_decimals
-    price_usd = sf_to_float(usdc_reserve.liquidity.market_price_sf)
-
-    all_obligations = await fetch_accounts_safe(client, program, "Obligation")
-
-    results = []
-    for pk, obl in all_obligations:
-        if str(obl.lending_market) != str(market_pk):
-            continue
-        for dep in obl.deposits:
-            if str(dep.deposit_reserve) != usdc_reserve_pk or dep.deposited_amount == 0:
+        # Per-reserve conversion constants, resolved once.
+        tracked = {}
+        for pk, acc in reserves.items():
+            mint = str(acc.liquidity.mint_pubkey)
+            if core.TRACKED_MINTS and mint not in core.TRACKED_MINTS:
                 continue
-            supplied_ui = (dep.deposited_amount * exchange_rate) / (10 ** decimals)
-            results.append({
-                "owner": str(obl.owner),
-                "supplied_usd": round(supplied_ui * price_usd, 6),
-            })
-
-    await client.close()
-    return results
-
-
-# ---------------------------------------------------------------------------
-# STATO PUNTI (points_state.csv) + ARCHIVIO SNAPSHOT
-# ---------------------------------------------------------------------------
-def load_state(path):
-    """address -> {cumulative_points, last_supplied_usd, last_snapshot_ts}"""
-    if not os.path.exists(path):
-        return {}
-    state = {}
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            state[row["address"]] = {
-                "cumulative_points": float(row["cumulative_points"]),
-                "last_supplied_usd": float(row["last_supplied_usd"]),
-                "last_snapshot_ts": int(row["last_snapshot_ts"]),
+            total_liquidity = (
+                acc.liquidity.total_available_amount
+                + core.sf_to_float(acc.liquidity.borrowed_amount_sf)
+            )
+            collateral_supply = acc.collateral.mint_total_supply
+            tracked[str(pk)] = {
+                "mint": mint,
+                "exchange_rate": total_liquidity / collateral_supply if collateral_supply > 0 else 1.0,
+                "decimals": acc.liquidity.mint_decimals,
+                "price_usd": core.sf_to_float(acc.liquidity.market_price_sf),
             }
-    return state
+        if not tracked:
+            raise RuntimeError(
+                f"no reserve in {market_address} matches TRACKED_MINTS={core.TRACKED_MINTS}")
 
+        obligations = await fetch_accounts_filtered(
+            client, program, "Obligation", obligation_offset, market_pk)
 
-def save_state(path, state):
-    """Salva ordinato per punti decrescenti: il file E' la classifica."""
-    rows = sorted(
-        ({"address": addr, **v} for addr, v in state.items()),
-        key=lambda r: r["cumulative_points"],
-        reverse=True,
-    )
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["address", "cumulative_points", "last_supplied_usd", "last_snapshot_ts"]
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def save_raw_snapshot(directory, now_ts, suppliers):
-    os.makedirs(directory, exist_ok=True)
-    fname = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d_%Hh%M")
-    path = os.path.join(directory, f"{fname}.csv")
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["owner", "supplied_usd"])
-        writer.writeheader()
-        writer.writerows(suppliers)
-    return path
-
-
-def update_points(state, suppliers, now_ts):
-    """Accredita punti = saldo precedente x ore trascorse, poi aggiorna il saldo.
-
-    Usa il saldo registrato ALL'INIZIO dell'intervallo per calcolare i punti
-    dell'intervallo appena trascorso (approssimazione standard quando non hai
-    eventi in tempo reale) — poi lo sostituisce col saldo appena letto.
-    """
-    snapshot_balances = {}
-    for row in suppliers:
-        snapshot_balances[row["owner"]] = snapshot_balances.get(row["owner"], 0.0) + row["supplied_usd"]
-
-    all_addresses = set(state.keys()) | set(snapshot_balances.keys())
-
-    for addr in all_addresses:
-        prev = state.get(addr)
-        if prev is None:
-            # Primo avvistamento: nessun punto ancora, si parte da qui.
-            state[addr] = {
-                "cumulative_points": 0.0,
-                "last_supplied_usd": snapshot_balances.get(addr, 0.0),
-                "last_snapshot_ts": now_ts,
-            }
-            continue
-
-        elapsed_hours = (now_ts - prev["last_snapshot_ts"]) / 3600
-        points_earned = prev["last_supplied_usd"] * elapsed_hours
-
-        prev["cumulative_points"] += points_earned
-        prev["last_supplied_usd"] = snapshot_balances.get(addr, 0.0)  # 0 se ha prelevato tutto
-        prev["last_snapshot_ts"] = now_ts
-
-    return state
+        rows = []
+        for _pk, obl in obligations:
+            for dep in obl.deposits:
+                r = tracked.get(str(dep.deposit_reserve))
+                if r is None or dep.deposited_amount == 0:
+                    continue
+                supplied_ui = (dep.deposited_amount * r["exchange_rate"]) / (10 ** r["decimals"])
+                rows.append({
+                    "owner": str(obl.owner),
+                    "mint": r["mint"],
+                    "supplied_usd": round(supplied_ui * r["price_usd"], 6),
+                })
+        print(f"  reserves tracked: {len(tracked)} | obligations: {len(obligations)} | deposits: {len(rows)}")
+        return rows
+    finally:
+        await client.close()
 
 
 # ---------------------------------------------------------------------------
-# LOOP PRINCIPALE
+# CYCLE
 # ---------------------------------------------------------------------------
-async def run_once():
+async def run_once(force=False, reset_scope=False):
     now_ts = int(time.time())
-    suppliers = await fetch_usdc_suppliers(MARKET_ADDRESS)
+    stamp = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{stamp}] market={core.MARKET_ADDRESS} basis={core.POINTS_BASIS}")
 
-    snapshot_path = save_raw_snapshot(SNAPSHOT_DIR, now_ts, suppliers)
-    state = load_state(STATE_FILE)
-    state = update_points(state, suppliers, now_ts)
-    save_state(STATE_FILE, state)
+    meta = core.load_meta(core.META_FILE)
+    core.check_scope(meta, reset_scope)
 
-    ts_label = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{ts_label}] {len(suppliers)} depositi USDC letti | snapshot -> {snapshot_path} | stato -> {STATE_FILE}")
+    rows = await fetch_market_deposits(core.MARKET_ADDRESS)
+    balances = core.aggregate_by_owner(rows)
+
+    state = core.load_state(core.STATE_FILE)
+    # Everything that can refuse the write happens BEFORE anything is written.
+    core.guard_supply_collapse(state, balances, force)
+
+    prev_run_ts = meta.get("last_run_ts") or max(
+        (v["last_snapshot_ts"] for v in state.values()), default=0)
+    state = core.update_points(state, balances, now_ts, prev_run_ts)
+    pruned = core.prune_state(state)
+
+    snapshot_path = core.save_raw_snapshot(core.SNAPSHOT_DIR, now_ts, rows)
+    written = core.save_state(core.STATE_FILE, state)
+    core.save_meta(core.META_FILE, {
+        "schema_version": core.SCHEMA_VERSION,
+        "market": core.MARKET_ADDRESS,
+        "tracked_mints": sorted(core.TRACKED_MINTS),
+        "points_basis": core.POINTS_BASIS,
+        "last_run_ts": now_ts,
+        "last_run_utc": stamp,
+        "addresses": written,
+        "total_supplied_usd": round(sum(balances.values()), 6),
+    })
+    print(f"  wrote {written} addresses ({pruned} pruned) | snapshot -> {os.path.basename(snapshot_path)}")
 
 
 async def main_loop():
@@ -220,9 +180,38 @@ async def main_loop():
         try:
             await run_once()
         except Exception as e:
-            print(f"Errore durante lo snapshot: {e}")
-        await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
+            print(f"snapshot failed: {e}", file=sys.stderr)
+        await asyncio.sleep(core.SNAPSHOT_INTERVAL_SECONDS)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Kamino points farming tracker")
+    p.add_argument("--once", action="store_true",
+                   help="run a single cycle and exit (non-zero on failure). Use this in CI.")
+    p.add_argument("--force", action="store_true",
+                   help="write even if the supply-collapse guard trips")
+    p.add_argument("--reset-scope", action="store_true",
+                   help="accept a changed market / tracked mints")
+    args = p.parse_args()
+
+    if not args.once:
+        asyncio.run(main_loop())
+        return 0
+
+    if core.JITTER_MAX_SECONDS > 0:
+        delay = random.randint(0, core.JITTER_MAX_SECONDS)
+        print(f"jitter: sleeping {delay}s so the snapshot instant is not the published cron time")
+        time.sleep(delay)
+
+    try:
+        asyncio.run(run_once(force=args.force, reset_scope=args.reset_scope))
+    except Exception as e:
+        # Fail loudly. A job that exits 0 after a failed read would commit a stale or damaged
+        # leaderboard, which is worse than not running at all.
+        print(f"FAILED: {e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    sys.exit(main())

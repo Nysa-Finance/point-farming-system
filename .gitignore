@@ -1,0 +1,18 @@
+# Virtualenv. This was committed once (1,900 files of a macOS-specific venv that no CI
+# runner can use); dependencies now live in requirements.txt.
+bin/
+lib/
+lib64/
+include/
+share/
+pyvenv.cfg
+.venv/
+venv/
+
+__pycache__/
+*.py[cod]
+
+# Written atomically via a .tmp sibling; a crash can leave one behind.
+*.tmp
+
+.DS_Store
