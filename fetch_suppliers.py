@@ -101,6 +101,10 @@ async def fetch_market_suppliers(market_address: str):
 
 
 if __name__ == "__main__":
-    data = asyncio.run(fetch_market_suppliers("FteaGMVCLDF4eonrTiQkRQ5kby5ohwCfaMD2mNiPkZL7"))
+    # Market comes from points_core so these debugging scripts can never drift onto a
+    # different market than the tracker itself. Override with KAMINO_MARKET.
+    from points_core import MARKET_ADDRESS
+
+    data = asyncio.run(fetch_market_suppliers(MARKET_ADDRESS))
     for row in data:
         print(row)

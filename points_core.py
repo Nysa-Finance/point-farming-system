@@ -37,9 +37,14 @@ RPC_URL = _env("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
 KLEND_PROGRAM_ID = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"
 
-# The Kamino lending market to track. MUST match VITE_KAMINO_MARKET in the dapp, or the
-# leaderboard describes a market the UI never shows. Guarded at runtime, see check_scope().
-MARKET_ADDRESS = _env("KAMINO_MARKET", "FteaGMVCLDF4eonrTiQkRQ5kby5ohwCfaMD2mNiPkZL7")
+# The Kamino lending market to track. This default IS VITE_KAMINO_MARKET's default in
+# nysa-dapp (src/chains/chains.ts) — the two are set in different repositories and a mismatch
+# produces a leaderboard for a market the UI never shows, with no error anywhere. Keep them
+# equal, and override both together if the market ever moves.
+#
+# Changing this invalidates an existing points_state.csv: points accrued against one market
+# mean nothing against another. check_scope() refuses to run rather than blend the two.
+MARKET_ADDRESS = _env("KAMINO_MARKET", "F4uLsGZT4YnHDcemtoYDz2LBZKLmwTB1wzkwS6oqygvy")
 
 # Which reserves count toward points. Empty = every reserve in the market, which is what
 # makes collateral deposits (USDY) earn alongside lent liquidity (USDC). Set to a
@@ -86,6 +91,29 @@ JITTER_MAX_SECONDS = _env_int("JITTER_MAX_SECONDS", 0)
 
 SCALE = 1 << 60  # Fraction U68F60 — every "_sf" field is scaled by this
 SCHEMA_VERSION = 2
+
+
+def describe_exception(e: BaseException) -> str:
+    """A one-line description that is never empty.
+
+    The Solana and HTTP client stacks raise exceptions whose str() is the empty string, so
+    `print(f"FAILED: {e}")` produces a bare "FAILED:" and a CI log with nothing to act on.
+    Fall back through the type name, the provider-specific message attributes, and the
+    underlying cause until there is something to read.
+    """
+    parts = [type(e).__name__]
+    msg = str(e).strip()
+    if msg:
+        parts.append(msg)
+    for attr in ("error_msg", "message", "detail"):
+        value = getattr(e, attr, None)
+        text = str(value).strip() if value is not None else ""
+        if text and text != msg:
+            parts.append(f"{attr}={text}")
+    cause = e.__cause__ or e.__context__
+    if cause is not None and cause is not e:
+        parts.append(f"caused by {type(cause).__name__}: {str(cause).strip() or '<no message>'}")
+    return " | ".join(parts)
 
 
 def sf_to_float(raw_sf: int) -> float:

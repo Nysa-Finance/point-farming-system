@@ -26,6 +26,7 @@ import os
 import random
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 
 import base58
@@ -55,15 +56,24 @@ async def fetch_accounts_filtered(client, program, account_name, market_offset, 
     megabytes, which public and most keyed RPCs simply refuse.
     """
     disc = account_discriminator(account_name)
-    resp = await client.get_program_accounts(
-        KLEND_PROGRAM_ID,
-        encoding="base64",
-        commitment=Finalized,
-        filters=[
-            MemcmpOpts(offset=0, bytes=base58.b58encode(disc).decode()),
-            MemcmpOpts(offset=market_offset, bytes=str(market_pk)),
-        ],
-    )
+    try:
+        resp = await client.get_program_accounts(
+            KLEND_PROGRAM_ID,
+            encoding="base64",
+            commitment=Finalized,
+            filters=[
+                MemcmpOpts(offset=0, bytes=base58.b58encode(disc).decode()),
+                MemcmpOpts(offset=market_offset, bytes=str(market_pk)),
+            ],
+        )
+    except Exception as e:
+        # Name the call that failed. Many providers disable or heavily restrict
+        # getProgramAccounts, and the client raises that as an exception with no message.
+        raise RuntimeError(
+            f"getProgramAccounts({account_name}) failed against {core.RPC_URL.split('?')[0]} "
+            f"-- {core.describe_exception(e)}. Most providers restrict or rate-limit this "
+            f"call; confirm the endpoint allows it and that the plan covers it."
+        ) from e
     decoded, skipped = [], 0
     for entry in resp.value:
         try:
@@ -143,7 +153,7 @@ async def fetch_market_deposits(market_address: str):
 async def run_once(force=False, reset_scope=False):
     now_ts = int(time.time())
     stamp = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{stamp}] market={core.MARKET_ADDRESS} basis={core.POINTS_BASIS}")
+    print(f"[{stamp}] market={core.MARKET_ADDRESS} basis={core.POINTS_BASIS}", flush=True)
 
     meta = core.load_meta(core.META_FILE)
     core.check_scope(meta, reset_scope)
@@ -180,7 +190,7 @@ async def main_loop():
         try:
             await run_once()
         except Exception as e:
-            print(f"snapshot failed: {e}", file=sys.stderr)
+            print(f"snapshot failed: {core.describe_exception(e)}", file=sys.stderr, flush=True)
         await asyncio.sleep(core.SNAPSHOT_INTERVAL_SECONDS)
 
 
@@ -206,9 +216,12 @@ def main():
     try:
         asyncio.run(run_once(force=args.force, reset_scope=args.reset_scope))
     except Exception as e:
-        # Fail loudly. A job that exits 0 after a failed read would commit a stale or damaged
-        # leaderboard, which is worse than not running at all.
-        print(f"FAILED: {e}", file=sys.stderr)
+        # Fail loudly AND legibly. A job that exits 0 after a failed read would commit a
+        # stale or damaged leaderboard; a job that exits 1 with no message is nearly as bad,
+        # because nobody can tell which of the guards or the RPC actually refused.
+        sys.stdout.flush()
+        print(f"FAILED: {core.describe_exception(e)}", file=sys.stderr, flush=True)
+        traceback.print_exc()
         return 1
     return 0
 

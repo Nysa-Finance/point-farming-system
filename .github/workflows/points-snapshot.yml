@@ -62,9 +62,10 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Check RPC is configured
+      - name: Preflight
         env:
           SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+          KAMINO_MARKET: ${{ vars.KAMINO_MARKET || secrets.KAMINO_MARKET }}
         run: |
           if [ -z "$SOLANA_RPC_URL" ]; then
             echo "::error::SOLANA_RPC_URL secret is not set."
@@ -74,15 +75,35 @@ jobs:
             exit 1
           fi
 
+          # Print the market this run will actually use. Points are worthless against the
+          # wrong market and nothing downstream can detect it, so put it where a human
+          # reading the log sees it before anything is written.
+          if [ -z "$KAMINO_MARKET" ]; then
+            echo "::warning::KAMINO_MARKET is not configured — falling back to the default in"
+            echo "points_core.py. Confirm it matches VITE_KAMINO_MARKET in the dapp."
+          else
+            echo "Market for this run: $KAMINO_MARKET"
+            echo "This MUST equal VITE_KAMINO_MARKET in nysa-dapp."
+          fi
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Take snapshot
         env:
+          # Unbuffered, so the run header and any traceback interleave in the order they
+          # actually happened. Buffered stdout put "FAILED:" above the line saying which
+          # market the run was even using.
+          PYTHONUNBUFFERED: '1'
           SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
           # Repository variables, all optional — unset falls back to the defaults in
           # points_core.py. KAMINO_MARKET must match VITE_KAMINO_MARKET in the dapp.
-          KAMINO_MARKET: ${{ vars.KAMINO_MARKET }}
+          #
+          # Read from either store. A market address is not a credential and belongs in a
+          # variable, but setting it as a secret is an easy mistake and the failure mode is
+          # silent: `vars.KAMINO_MARKET` would resolve to empty, the code default would take
+          # over, and the job would happily build a leaderboard for the wrong market.
+          KAMINO_MARKET: ${{ vars.KAMINO_MARKET || secrets.KAMINO_MARKET }}
           TRACKED_MINTS: ${{ vars.TRACKED_MINTS }}
           POINTS_BASIS: ${{ vars.POINTS_BASIS }}
           MIN_SUPPLY_RATIO: ${{ vars.MIN_SUPPLY_RATIO }}

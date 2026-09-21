@@ -188,6 +188,46 @@ class TestStateIO(unittest.TestCase):
             self.assertEqual(core.load_meta(p)["market"], "M")
 
 
+class TestDescribeException(unittest.TestCase):
+    """The real failure this guards: `FAILED: ` with nothing after the colon."""
+
+    def test_exception_with_no_message_still_describes_itself(self):
+        class SilentRpcError(Exception):
+            def __str__(self):
+                return ""
+
+        out = core.describe_exception(SilentRpcError())
+        self.assertIn("SilentRpcError", out)
+        self.assertTrue(out.strip())
+
+    def test_ordinary_message_is_kept(self):
+        self.assertIn("boom", core.describe_exception(ValueError("boom")))
+
+    def test_provider_error_attribute_is_surfaced(self):
+        class RpcError(Exception):
+            def __str__(self):
+                return ""
+            error_msg = "410 Gone: getProgramAccounts is disabled on this plan"
+
+        out = core.describe_exception(RpcError())
+        self.assertIn("getProgramAccounts is disabled", out)
+
+    def test_cause_is_surfaced(self):
+        try:
+            try:
+                raise ConnectionResetError("connection reset by peer")
+            except ConnectionResetError as inner:
+                raise RuntimeError("fetch failed") from inner
+        except RuntimeError as e:
+            out = core.describe_exception(e)
+        self.assertIn("fetch failed", out)
+        self.assertIn("connection reset by peer", out)
+
+    def test_never_returns_empty(self):
+        for e in (Exception(), ValueError(""), RuntimeError(None)):
+            self.assertTrue(core.describe_exception(e).strip())
+
+
 class TestIdlLayout(unittest.TestCase):
     """The memcmp offset is what keeps getProgramAccounts to one market. Pin it."""
 

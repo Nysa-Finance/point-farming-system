@@ -83,7 +83,7 @@ Every setting is an environment variable, so CI never edits source.
 | Variable | Default | Purpose |
 |---|---|---|
 | `SOLANA_RPC_URL` | public mainnet-beta | Solana RPC. **Set this** — see *RPC requirements*. |
-| `KAMINO_MARKET` | `FteaGMVC…kZL7` | Lending market to track. Must match `VITE_KAMINO_MARKET` in the dapp. |
+| `KAMINO_MARKET` | `F4uLsGZT…ygvy` | Lending market to track. The default already matches `VITE_KAMINO_MARKET` in the dapp — only set this if the market moves, and change both together. |
 | `TRACKED_MINTS` | *(empty — all reserves)* | Comma-separated mints. Empty means every reserve in the market counts, so collateral earns alongside lent liquidity. |
 | `POINTS_BASIS` | `min` | See above. |
 | `NEW_ADDRESS_BACKDATE_FRACTION` | `0.5` | Fraction of the interval credited to a first-seen address. |
